@@ -1,0 +1,24 @@
+name: Build
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build local app
+        run: ./scripts/build.sh
+      - name: Verify bundle
+        run: |
+          plutil -lint build/Gauge.app/Contents/Info.plist
+          codesign --verify --strict build/Gauge.app
+      - name: Archive app
+        run: ditto -c -k --keepParent build/Gauge.app build/Gauge.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Gauge-macOS
+          path: build/Gauge.zip
