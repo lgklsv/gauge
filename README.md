@@ -1,14 +1,4 @@
-<p align="center">
-  <img src="docs/icon.png" width="80" alt="Gauge icon">
-</p>
-
-<h1 align="center">Gauge</h1>
-
-<p align="center">Codex usage, at a glance.</p>
-
-<p align="center">
-  <img src="docs/menu.png" width="300" alt="Gauge menu showing Codex usage limits and estimated API cost">
-</p>
+# Gauge
 
 A small native macOS menu bar app, built with Swift and AppKit. No dependencies, no Dock icon, no settings window.
 
