@@ -11,6 +11,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var estimate = loadJSON("estimate-v1.json", as: Estimate.self)
     private var estimateRefreshedAt = Date.distantPast
     private var errorMessage: String?
+    private var loginError: String?
     private var refreshing = false
     private var retryAt = Date.distantPast
     private var failures = 0
@@ -38,14 +39,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let center = NSWorkspace.shared.notificationCenter
         center.addObserver(self, selector: #selector(willSleep), name: NSWorkspace.willSleepNotification, object: nil)
         center.addObserver(self, selector: #selector(didWake), name: NSWorkspace.didWakeNotification, object: nil)
-        // Enable by default once, respecting subsequent changes in System Settings.
-        if !UserDefaults.standard.bool(forKey: "didConfigureLogin") {
-            do {
-                if SMAppService.mainApp.status == .notRegistered { try SMAppService.mainApp.register() }
-                UserDefaults.standard.set(true, forKey: "didConfigureLogin")
-            } catch { errorMessage = "Could not enable Launch at Login: \(error.localizedDescription)" }
-        }
+        configureLogin()
         refresh()
+    }
+
+    private func configureLogin() {
+        let service = SMAppService.mainApp
+        let defaults = UserDefaults.standard
+        let path = Bundle.main.bundleURL.standardizedFileURL.path
+        let registeredPath = defaults.string(forKey: "loginRegistrationPath")
+        if service.status == .enabled || service.status == .requiresApproval {
+            defaults.set(path, forKey: "loginRegistrationPath")
+            if service.status == .requiresApproval {
+                loginError = "Approve Gauge in System Settings → General → Login Items."
+            }
+            return
+        }
+        // Register a new installation location, but respect a later user disable.
+        // The old didConfigureLogin flag cannot prove that registration succeeded.
+        if service.status == .notRegistered && registeredPath == path { return }
+        do {
+            try service.register()
+            if service.status == .enabled || service.status == .requiresApproval {
+                defaults.set(path, forKey: "loginRegistrationPath")
+            }
+            if service.status != .enabled {
+                loginError = "Check Gauge in System Settings → General → Login Items."
+            }
+        } catch {
+            loginError = "Could not enable Launch at Login: \(error.localizedDescription)"
+        }
     }
 
     func menuWillOpen(_ menu: NSMenu) {
@@ -171,6 +194,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             warningItem.isEnabled = false
             warningItem.toolTip = warning
         }
+        if let loginError {
+            let warning = item("Launch at Login needs attention")
+            warning.isEnabled = false
+            warning.toolTip = loginError
+        }
         menu.addItem(.separator())
         item("Quit Gauge", action: #selector(quit))
     }
@@ -179,6 +207,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 @main
 struct Gauge {
     static func main() async {
+        if CommandLine.arguments.contains("--login-status") {
+            let status: String
+            switch SMAppService.mainApp.status {
+            case .notRegistered: status = "not registered"
+            case .enabled: status = "enabled"
+            case .requiresApproval: status = "requires approval"
+            case .notFound: status = "not found"
+            @unknown default: status = "unknown"
+            }
+            print("Launch at login: \(status)")
+            print("App: \(Bundle.main.bundleURL.path)")
+            return
+        }
         if CommandLine.arguments.contains("--diagnose") {
             // Read-only integration check. Never print credentials or session contents.
             do {

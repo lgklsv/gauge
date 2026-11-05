@@ -16,7 +16,7 @@ Requires macOS 13 or newer and Xcode with its command-line tools selected.
 ./scripts/build.sh
 ```
 
-Open `build/Gauge.app`, or copy it to `/Applications` first. Launch at login is enabled by default on the first app launch, with no menu toggle; manage it in macOS Login Items settings. Keep the app at a stable location for login launching.
+Open `build/Gauge.app`, or copy it to `/Applications` first. Launch at login is enabled by default for a new installation location, with no menu toggle; manage it in macOS Login Items settings. Gauge checks the actual system registration before recording success and retries setup after moving the app. A later user disable at the same location is respected. Keep the app at a stable location for login launching.
 
 The build uses local ad-hoc signing automatically. No Apple Developer account, signing certificate, or notarization is needed for this locally built app. Downloaded builds on other Macs may be subject to Gatekeeper checks.
 
@@ -40,6 +40,7 @@ Local state lives in `~/Library/Application Support/Gauge`: last successful usag
 swift build -c release
 ./scripts/build.sh
 codesign --verify --strict build/Gauge.app
+build/Gauge.app/Contents/MacOS/Gauge --login-status
 build/Gauge.app/Contents/MacOS/Gauge --diagnose
 ```
 
