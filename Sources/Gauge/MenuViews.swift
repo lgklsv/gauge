@@ -61,7 +61,7 @@ final class LimitView: NSView {
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
     func updateCountdown() { countdown.stringValue = usage.countdown() }
     override func draw(_ dirtyRect: NSRect) {
-        let bar = NSRect(x: 14, y: 14, width: bounds.width - 28, height: 4)
+        let bar = NSRect(x: 16, y: 14, width: bounds.width - 32, height: 4)
         NSColor.systemBlue.withAlphaComponent(0.20).setFill()
         NSBezierPath(roundedRect: bar, xRadius: 2, yRadius: 2).fill()
         if usage.percent > 0 {
@@ -108,9 +108,11 @@ final class EstimateView: NSView {
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
     override func draw(_ dirtyRect: NSRect) {
         guard let maxValue = values.max(), values.count > 1 else { return }
-        let area = NSRect(x: 15, y: 88, width: bounds.width - 30, height: 22)
+        // Include the 0.75 pt half-stroke in the shared 16 pt inset.
+        let area = NSRect(x: 16.75, y: 88, width: bounds.width - 33.5, height: 22)
         let path = NSBezierPath()
         path.lineWidth = 1.5
+        path.lineCapStyle = .round
         path.lineJoinStyle = .round
         for (index, value) in values.enumerated() {
             let point = NSPoint(x: area.minX + area.width * CGFloat(index) / CGFloat(values.count - 1),
