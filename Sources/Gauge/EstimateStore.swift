@@ -10,6 +10,45 @@ private struct RateCache: Codable {
     var fetchedAt: Date
     var table: [String: Rate]
 }
+private let neededModelsKey = CodingUserInfoKey(rawValue: "neededModels")!
+
+private func rateKeys(for model: String) -> [String] {
+    let key = String(model.lowercased().split(separator: "[", maxSplits: 1).first ?? "")
+    let bare = String(key.split(separator: "/").last ?? "")
+    guard !["", "synthetic", "opus", "sonnet", "haiku", "fable"].contains(bare) else { return [] }
+    return bare.hasPrefix("gpt-") ? [key, bare, String(bare.dropFirst(4))] : [key, bare]
+}
+
+private struct ModelKey: CodingKey {
+    var stringValue: String
+    var intValue: Int? { nil }
+    init(stringValue: String) { self.stringValue = stringValue }
+    init?(intValue: Int) { return nil }
+}
+
+private extension RateCache {
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: ModelKey.self)
+        fetchedAt = try container.decode(Date.self, forKey: ModelKey(stringValue: "fetchedAt"))
+        let tableKey = ModelKey(stringValue: "table")
+        guard let models = decoder.userInfo[neededModelsKey] as? Set<String> else {
+            table = try container.decode([String: Rate].self, forKey: tableKey)
+            return
+        }
+        let entries = try container.nestedContainer(keyedBy: ModelKey.self, forKey: tableKey)
+        table = [:]
+        for model in models {
+            for key in rateKeys(for: model) {
+                let codingKey = ModelKey(stringValue: key)
+                if entries.contains(codingKey) {
+                    table[model] = try entries.decode(Rate.self, forKey: codingKey)
+                    break
+                }
+            }
+        }
+    }
+}
+
 private struct TokenEvent: Codable {
     var time: Date
     var model: String
@@ -33,23 +72,39 @@ private struct Cursor: Codable {
 
 actor EstimateStore {
     private var files = loadJSON("sessions-v1.json", as: [String: Cursor].self) ?? [:]
-    private var rates = loadJSON("rates-v1.json", as: RateCache.self)
+    // Only prices referenced by retained sessions stay in memory. The complete
+    // table remains on disk so a newly used model can be priced offline.
+    private var rates: [String: Rate] = [:]
+    private var ratesFetchedAt: Date?
+    private var pricedModels = Set<String>()
     private var importedSwiftBar = loadJSON("swiftbar-imported.json", as: Bool.self) ?? false
     private var retryRatesAt = Date.distantPast
 
     func refresh() async -> Estimate {
-        await refreshRates()
-        return scanAndSummarize()
+        let unreadable = scanSessions()
+        var models = Set<String>()
+        for cursor in files.values {
+            models.formUnion(cursor.events.lazy.map(\.model))
+        }
+        await refreshRates(for: models)
+        var result = summarize(now: Date())
+        if unreadable { result.warning = "Some Codex session logs could not be read. Saved statistics are retained." }
+        if !models.isEmpty && ratesFetchedAt == nil {
+            result.warning = "Pricing unavailable. Token totals are shown; costs are incomplete."
+        } else if let fetchedAt = ratesFetchedAt, Date().timeIntervalSince(fetchedAt) > 2 * 86400 {
+            result.warning = "Using saved API prices; pricing refresh failed."
+        }
+        return result
     }
 
-    private func scanAndSummarize() -> Estimate {
+    private func scanSessions() -> Bool {
         let now = Date()
         let cutoff = now.addingTimeInterval(-32 * 86400)
         let fm = FileManager.default
         let directory = codexHome.appendingPathComponent("sessions")
         var unreadable = false
         let needsImport = !importedSwiftBar
-        var changed = importSwiftBarHistory(cutoff: cutoff)
+        var changed = autoreleasepool { importSwiftBarHistory(cutoff: cutoff) }
         if let enumerator = fm.enumerator(at: directory, includingPropertiesForKeys: nil,
                                            options: [.skipsHiddenFiles]) {
             for case let url as URL in enumerator where url.pathExtension == "jsonl" {
@@ -105,13 +160,7 @@ actor EstimateStore {
         }
         if changed { saveJSON(files, name: "sessions-v1.json") }
         if needsImport { saveJSON(true, name: "swiftbar-imported.json") }
-        var result = summarize(now: now)
-        if unreadable { result.warning = "Some Codex session logs could not be read. Saved statistics are retained." }
-        if rates == nil { result.warning = "Pricing unavailable. Token totals are shown; costs are incomplete." }
-        else if now.timeIntervalSince(rates!.fetchedAt) > 2 * 86400 {
-            result.warning = "Using saved API prices; pricing refresh failed."
-        }
-        return result
+        return unreadable
     }
 
     // Preserve estimates for logs already removed by Codex before migration.
@@ -192,38 +241,67 @@ actor EstimateStore {
         if event.tokens > 0 { cursor.events.append(event) }
     }
 
-    private func refreshRates() async {
+    private func refreshRates(for models: Set<String>) async {
+        guard !models.isEmpty else {
+            rates = [:]
+            pricedModels = []
+            return
+        }
+        if ratesFetchedAt == nil || models != pricedModels {
+            // Decode and filter inside the pool; do not retain the full table.
+            let cached: RateCache? = autoreleasepool {
+                guard let data = try? Data(contentsOf: supportDirectory.appendingPathComponent("rates-v1.json")) else { return nil }
+                let decoder = JSONDecoder()
+                decoder.userInfo[neededModelsKey] = models
+                return try? decoder.decode(RateCache.self, from: data)
+            }
+            if let cached {
+                rates = cached.table
+                ratesFetchedAt = cached.fetchedAt
+            } else {
+                rates = rates.filter { models.contains($0.key) }
+                ratesFetchedAt = nil
+            }
+            pricedModels = models
+        }
         guard Date() >= retryRatesAt,
-              rates == nil || Date().timeIntervalSince(rates!.fetchedAt) >= 86400 else { return }
+              ratesFetchedAt.map({ Date().timeIntervalSince($0) >= 86400 }) ?? true else { return }
         retryRatesAt = Date().addingTimeInterval(3600)
         do {
             var request = URLRequest(url: URL(string: "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json")!)
             request.timeoutInterval = 10
             let (data, response) = try await URLSession.shared.data(for: request)
-            guard (response as? HTTPURLResponse)?.statusCode == 200,
-                  let document = try JSONSerialization.jsonObject(with: data) as? [String: [String: Any]] else { return }
-            var table: [String: Rate] = [:]
-            for (name, entry) in document {
-                guard let input = entry["input_cost_per_token"] as? Double,
-                      let output = entry["output_cost_per_token"] as? Double,
-                      input.isFinite, output.isFinite, input >= 0, output >= 0 else { continue }
-                let cached = entry["cache_read_input_token_cost"] as? Double ?? input
-                let write = entry["cache_creation_input_token_cost"] as? Double ?? input
-                guard cached.isFinite, write.isFinite, cached >= 0, write >= 0 else { continue }
-                table[name.lowercased()] = Rate(input: input, output: output, cached: cached, cacheWrite: write)
+            guard (response as? HTTPURLResponse)?.statusCode == 200 else { return }
+            let filtered: RateCache? = autoreleasepool {
+                guard let document = try? JSONSerialization.jsonObject(with: data) as? [String: [String: Any]] else { return nil }
+                var table: [String: Rate] = [:]
+                for (name, entry) in document {
+                    guard let input = entry["input_cost_per_token"] as? Double,
+                          let output = entry["output_cost_per_token"] as? Double,
+                          input.isFinite, output.isFinite, input >= 0, output >= 0 else { continue }
+                    let cached = entry["cache_read_input_token_cost"] as? Double ?? input
+                    let write = entry["cache_creation_input_token_cost"] as? Double ?? input
+                    guard cached.isFinite, write.isFinite, cached >= 0, write >= 0 else { continue }
+                    table[name.lowercased()] = Rate(input: input, output: output, cached: cached, cacheWrite: write)
+                }
+                guard !table.isEmpty else { return nil }
+                let full = RateCache(fetchedAt: Date(), table: table)
+                saveJSON(full, name: "rates-v1.json")
+                return RateCache(fetchedAt: full.fetchedAt, table: prices(for: models, in: table))
             }
-            guard !table.isEmpty else { return }
-            rates = RateCache(fetchedAt: Date(), table: table)
-            saveJSON(rates!, name: "rates-v1.json")
+            if let filtered {
+                rates = filtered.table
+                ratesFetchedAt = filtered.fetchedAt
+            }
         } catch { /* Keep cached prices offline. */ }
     }
 
-    private func rate(for model: String) -> Rate? {
-        let key = String(model.lowercased().split(separator: "[", maxSplits: 1).first ?? "")
-        let bare = String(key.split(separator: "/").last ?? "")
-        guard !["", "synthetic", "opus", "sonnet", "haiku", "fable"].contains(bare) else { return nil }
-        let table = rates?.table ?? [:]
-        return table[key] ?? table[bare] ?? (bare.hasPrefix("gpt-") ? table[String(bare.dropFirst(4))] : nil)
+    private func prices(for models: Set<String>, in table: [String: Rate]) -> [String: Rate] {
+        var selected: [String: Rate] = [:]
+        for model in models {
+            selected[model] = rateKeys(for: model).lazy.compactMap { table[$0] }.first
+        }
+        return selected
     }
 
     private func summarize(now: Date) -> Estimate {
@@ -239,7 +317,7 @@ actor EstimateStore {
         }
         for cursor in files.values {
             for event in cursor.events where event.time <= now {
-                let rate = rate(for: event.model)
+                let rate = rates[event.model]
                 var cost = 0.0
                 if let rate {
                     cost = event.input * rate.input + event.cached * rate.cached

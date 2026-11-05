@@ -16,7 +16,7 @@ Requires macOS 13 or newer and Xcode with its command-line tools selected.
 ./scripts/build.sh
 ```
 
-Open `build/Gauge.app`, or copy it to `/Applications` first. Launch at login is registered on the first app launch; change it in the menu or macOS Login Items settings. Keep the app at a stable location for login launching.
+Open `build/Gauge.app`, or copy it to `/Applications` first. Launch at login is enabled by default on the first app launch, with no menu toggle; manage it in macOS Login Items settings. Keep the app at a stable location for login launching.
 
 The build uses local ad-hoc signing automatically. No Apple Developer account, signing certificate, or notarization is needed for this locally built app. Downloaded builds on other Macs may be subject to Gatekeeper checks.
 
@@ -26,13 +26,13 @@ Open `Package.swift` in Xcode to edit the source. Run the build script to produc
 
 Gauge reads the existing Codex login from `$CODEX_HOME/auth.json` (default `~/.codex/auth.json`) and calls `https://chatgpt.com/backend-api/wham/usage` with `URLSession`. This is an internal endpoint and may change. There is no persistent Codex subprocess. Credentials are never copied into Gauge's cache or logged. Gauge does not refresh OAuth tokens: if the session expires, sign in through Codex again. Keychain-only Codex credential storage is not currently supported.
 
-Subscription usage refreshes roughly once a minute, when opening an outdated menu, and after waking. Requests never overlap. Failed requests use exponential backoff (up to 30 minutes) and respect longer server Retry-After values, including for manual refresh. Saved usage remains visible after an error. Countdown labels update only while the menu is open. No animations or continuous rendering.
+Subscription usage refreshes roughly once a minute, when opening an outdated menu, and after waking. Requests never overlap. Failed requests use exponential backoff (up to 30 minutes) and respect longer server Retry-After values, including for manual refresh. Saved usage remains visible after an error. Local statistics refresh independently of usage freshness and network backoff; saved totals appear immediately at launch, with a loading placeholder if no estimate has been saved yet. Countdown labels update only while the menu is open. No animations or continuous rendering.
 
-API estimates are computed locally from `~/.codex/sessions/**/*.jsonl`. This is the estimated API equivalent, **not a bill or subscription charge**. Prices use the same LiteLLM table as the original SwiftBar plugin, cached for 24 hours. Only the model pricing table is downloaded; session contents are not uploaded.
+API estimates are computed locally from `~/.codex/sessions/**/*.jsonl`. This is the estimated API equivalent, **not a bill or subscription charge**. Prices use the same LiteLLM table as the original SwiftBar plugin, cached for 24 hours. Only the model pricing table is downloaded; session contents are not uploaded. The full pricing table stays on disk; only prices for models in retained sessions are decoded into memory. New models are resolved from the disk cache, including offline.
 
 The first pass indexes recent logs. Subsequent passes inspect file metadata and read only appended records. Incomplete final lines wait for the next pass. Token events are retained for 32 days, even if the source log disappears. Fork-copy suppression and consecutive duplicate token-event suppression follow the original plugin. Costs use uncached input, cached input, cache-write, and output token rates; reasoning tokens are not added again to output. Unknown prices produce a `*` beside the partial estimate; tokens still count. Today uses the local calendar, 7/30 days are rolling windows, and the sparkline shows seven calendar days.
 
-Local state lives in `~/Library/Application Support/Gauge`: last successful usage, pricing, file cursors, and recent token events. Caches contain timestamps, model names, local log paths, and token counts, but no conversation text or credentials. Files are private to the current user. On the first statistics pass, Gauge also imports retained events for already-deleted logs from `~/Library/Caches/swiftbar-codex-estimate.json`, if present. The original SwiftBar cache is left untouched.
+Local state lives in `~/Library/Application Support/Gauge`: last successful usage, the latest estimate, pricing, file cursors, and recent token events. Caches contain timestamps, model names, local log paths, and token counts, but no conversation text or credentials. Files are private to the current user. On the first statistics pass, Gauge also imports retained events for already-deleted logs from `~/Library/Caches/swiftbar-codex-estimate.json`, if present. The original SwiftBar cache is left untouched.
 
 ## Validation
 

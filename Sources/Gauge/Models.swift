@@ -20,7 +20,7 @@ struct UsageSnapshot: Codable {
     var fetchedAt: Date
 }
 
-struct Bucket {
+struct Bucket: Codable {
     var cost = 0.0
     var tokens = 0.0
     var unpriced = 0.0
@@ -33,7 +33,7 @@ struct Bucket {
     }
 }
 
-struct Estimate {
+struct Estimate: Codable {
     var today = Bucket()
     var week = Bucket()
     var month = Bucket()
@@ -52,18 +52,22 @@ let supportDirectory = FileManager.default.urls(for: .applicationSupportDirector
     .appendingPathComponent("Gauge", isDirectory: true)
 
 func loadJSON<T: Decodable>(_ name: String, as type: T.Type) -> T? {
-    guard let data = try? Data(contentsOf: supportDirectory.appendingPathComponent(name)) else { return nil }
-    return try? JSONDecoder().decode(type, from: data)
+    autoreleasepool {
+        guard let data = try? Data(contentsOf: supportDirectory.appendingPathComponent(name)) else { return nil }
+        return try? JSONDecoder().decode(type, from: data)
+    }
 }
 
 func saveJSON<T: Encodable>(_ value: T, name: String) {
-    do {
-        try FileManager.default.createDirectory(at: supportDirectory, withIntermediateDirectories: true,
-                                               attributes: [.posixPermissions: 0o700])
-        let url = supportDirectory.appendingPathComponent(name)
-        try JSONEncoder().encode(value).write(to: url, options: .atomic)
-        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
-    } catch { /* A cache write must not prevent displaying live data. */ }
+    autoreleasepool {
+        do {
+            try FileManager.default.createDirectory(at: supportDirectory, withIntermediateDirectories: true,
+                                                   attributes: [.posixPermissions: 0o700])
+            let url = supportDirectory.appendingPathComponent(name)
+            try JSONEncoder().encode(value).write(to: url, options: .atomic)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+        } catch { /* A cache write must not prevent displaying live data. */ }
+    }
 }
 
 private let dateLock = NSLock()
