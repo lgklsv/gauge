@@ -1,3 +1,5 @@
+<img src="docs/icon.png" width="80" alt="Gauge icon">
+
 # Gauge
 
 A small native macOS menu bar app, built with Swift and AppKit. No dependencies, no Dock icon, no settings window.
