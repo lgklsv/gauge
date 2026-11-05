@@ -42,11 +42,11 @@ final class LimitView: NSView {
         super.init(frame: NSRect(x: 0, y: 0, width: width, height: 58))
         let title = NSTextField(labelWithString: window.label)
         title.font = .systemFont(ofSize: 13, weight: .medium)
-        title.frame = NSRect(x: 14, y: 30, width: 90, height: 20)
+        title.frame = NSRect(x: 14, y: 30, width: title.intrinsicContentSize.width, height: 20)
         addSubview(title)
         countdown.font = .systemFont(ofSize: 11)
         countdown.textColor = .secondaryLabelColor
-        countdown.frame = NSRect(x: window.label == "Code review" ? 104 : 83, y: 32, width: 118, height: 16)
+        countdown.frame = NSRect(x: title.frame.maxX + 6, y: 32, width: 118, height: 16)
         addSubview(countdown)
         let percent = NSTextField(labelWithString: String(format: "%.0f%%", window.percent))
         percent.font = .monospacedDigitSystemFont(ofSize: 13, weight: .medium)
