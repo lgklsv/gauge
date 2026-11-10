@@ -22,7 +22,7 @@ The build handles local ad-hoc signing. No Apple Developer account or signing ce
 
 ## How it works
 
-Usage limits come from Codex's and Claude's internal usage endpoints using your existing logins. Updates run at launch, roughly once a minute, after waking, or when you click **Refresh**. Opening the menu doesn't trigger a request. Gauge never refreshes tokens itself: if a session expires, use Codex or Claude Code again.
+Usage limits come from Codex's and Claude's internal usage endpoints using your existing logins. Updates run at launch, roughly once a minute for Codex and every five minutes for Claude, after waking, or when you click **Refresh**. Opening the menu doesn't trigger a request. Gauge never refreshes tokens itself: if a session expires, use Codex or Claude Code again.
 
 Cost estimates are calculated locally from Codex session logs and Claude Code project logs using [LiteLLM's pricing table](https://github.com/BerriAI/litellm/blob/main/model_prices_and_context_window.json). They represent the API equivalent of your usage, **not a subscription bill**. A `*` marks an estimate with missing model prices.
 

@@ -9,8 +9,8 @@ enum Provider: String, CaseIterable, Codable {
     var refreshInterval: TimeInterval {
         switch self {
         case .codex: return 60
-        // Claude's usage endpoint rate limits aggressively; raise to 300 if 429s are frequent.
-        case .claude: return 60
+        // Claude's usage endpoint rate limits a one-minute interval.
+        case .claude: return 300
         }
     }
     var home: URL { self == .codex ? codexHome : claudeHome }
