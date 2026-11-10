@@ -195,11 +195,11 @@ final class EstimateView: NSView {
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
     override func draw(_ dirtyRect: NSRect) {
-        // One shared scale keeps the providers' lines comparable.
-        guard let maxValue = series.flatMap(\.values).max() else { return }
         // Include the 0.75 pt half-stroke in the shared 16 pt inset.
         let area = NSRect(x: 16.75, y: 84, width: bounds.width - 33.5, height: 22)
+        // Each line uses its own scale so a smaller provider's trend stays visible.
         for (values, color) in series where values.count > 1 {
+            let maxValue = values.max() ?? 0
             let path = NSBezierPath()
             path.lineWidth = 1.5
             path.lineCapStyle = .round
