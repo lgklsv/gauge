@@ -1,5 +1,30 @@
 import Foundation
 
+enum Provider: String, CaseIterable, Codable {
+    case codex, claude
+
+    var name: String { self == .codex ? "Codex" : "Claude" }
+    var mark: String { self == .codex ? "CodexMark" : "ClaudeMark" }
+    var cacheName: String { self == .codex ? "usage-v1.json" : "usage-claude-v1.json" }
+    var refreshInterval: TimeInterval {
+        switch self {
+        case .codex: return 60
+        // Claude's usage endpoint rate limits aggressively; raise to 300 if 429s are frequent.
+        case .claude: return 60
+        }
+    }
+    var home: URL { self == .codex ? codexHome : claudeHome }
+
+    var isEnabled: Bool {
+        get {
+            UserDefaults.standard.object(forKey: "\(rawValue)Enabled") as? Bool
+                ?? FileManager.default.fileExists(atPath: home.path)
+        }
+        nonmutating set { UserDefaults.standard.set(newValue, forKey: "\(rawValue)Enabled") }
+    }
+    static var enabled: [Provider] { allCases.filter(\.isEnabled) }
+}
+
 struct UsageWindow: Codable {
     var label: String
     var percent: Double
@@ -37,7 +62,8 @@ struct Estimate: Codable {
     var today = Bucket()
     var week = Bucket()
     var month = Bucket()
-    var dailyCosts = Array(repeating: 0.0, count: 7)
+    // Seven daily costs per provider, keyed by Provider.rawValue.
+    var dailyCosts: [String: [Double]] = [:]
     var warning: String?
 }
 
@@ -46,6 +72,13 @@ let codexHome: URL = {
         return URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
     }
     return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex")
+}()
+
+let claudeHome: URL = {
+    if let path = ProcessInfo.processInfo.environment["CLAUDE_CONFIG_DIR"], !path.isEmpty {
+        return URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
+    }
+    return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude")
 }()
 
 let supportDirectory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]

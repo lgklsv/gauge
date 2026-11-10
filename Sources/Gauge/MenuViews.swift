@@ -1,35 +1,62 @@
 import AppKit
 
+extension Provider {
+    var color: NSColor {
+        switch self {
+        case .codex: return .systemBlue
+        case .claude: return NSColor(srgbRed: 0xD9 / 255, green: 0x77 / 255, blue: 0x57 / 255, alpha: 1)
+        }
+    }
+    @MainActor var markImage: NSImage? {
+        Bundle.main.url(forResource: mark, withExtension: "png").flatMap(NSImage.init(contentsOf:))
+    }
+}
+
+struct StatusRing {
+    var provider: Provider
+    var percent: Double?
+    var stale: Bool
+}
+
 @MainActor
-func statusImage(percent: Double?, stale: Bool) -> NSImage {
-    let image = NSImage(size: NSSize(width: 22, height: 22), flipped: false) { rect in
-        let circle = NSBezierPath(ovalIn: rect.insetBy(dx: 2, dy: 2))
-        circle.lineWidth = 2
-        NSColor.labelColor.withAlphaComponent(0.22).setStroke()
-        circle.stroke()
-        if let percent, percent > 0 {
-            let arc = NSBezierPath()
-            arc.lineWidth = 2
-            arc.lineCapStyle = .round
-            arc.appendArc(
-                withCenter: NSPoint(x: 11, y: 11), radius: 9,
-                startAngle: 90, endAngle: 90 - 360 * percent / 100, clockwise: true)
-            NSColor.labelColor.setStroke()
-            arc.stroke()
+func statusImage(rings: [StatusRing]) -> NSImage {
+    // Wide enough to read as separate menu bar items that share one menu.
+    let spacing: CGFloat = 12
+    let width = CGFloat(max(rings.count, 1)) * (22 + spacing) - spacing
+    let image = NSImage(size: NSSize(width: width, height: 22), flipped: false) { _ in
+        if rings.isEmpty {
+            let circle = NSBezierPath(ovalIn: NSRect(x: 2, y: 2, width: 18, height: 18))
+            circle.lineWidth = 2
+            NSColor.labelColor.withAlphaComponent(0.22).setStroke()
+            circle.stroke()
         }
-        if let mark = NSImage(
-            contentsOf: Bundle.main.url(forResource: "CodexMark", withExtension: "png")
-                ?? URL(fileURLWithPath: "/nonexistent"))
-        {
-            mark.draw(in: NSRect(x: 5.5, y: 5.5, width: 11, height: 11))
-        } else {
-            let dot = NSBezierPath(ovalIn: NSRect(x: 8, y: 8, width: 6, height: 6))
-            NSColor.labelColor.setFill()
-            dot.fill()
-        }
-        if stale {
-            NSColor.labelColor.setFill()
-            NSBezierPath(ovalIn: NSRect(x: 17, y: 1, width: 4, height: 4)).fill()
+        for (index, ring) in rings.enumerated() {
+            let rect = NSRect(x: CGFloat(index) * (22 + spacing), y: 0, width: 22, height: 22)
+            let circle = NSBezierPath(ovalIn: rect.insetBy(dx: 2, dy: 2))
+            circle.lineWidth = 2
+            NSColor.labelColor.withAlphaComponent(0.22).setStroke()
+            circle.stroke()
+            if let percent = ring.percent, percent > 0 {
+                let arc = NSBezierPath()
+                arc.lineWidth = 2
+                arc.lineCapStyle = .round
+                arc.appendArc(
+                    withCenter: NSPoint(x: rect.midX, y: rect.midY), radius: 9,
+                    startAngle: 90, endAngle: 90 - 360 * percent / 100, clockwise: true)
+                NSColor.labelColor.setStroke()
+                arc.stroke()
+            }
+            if let mark = ring.provider.markImage {
+                mark.draw(in: NSRect(x: rect.minX + 5.5, y: 5.5, width: 11, height: 11))
+            } else {
+                let dot = NSBezierPath(ovalIn: NSRect(x: rect.minX + 8, y: 8, width: 6, height: 6))
+                NSColor.labelColor.setFill()
+                dot.fill()
+            }
+            if ring.stale {
+                NSColor.labelColor.setFill()
+                NSBezierPath(ovalIn: NSRect(x: rect.minX + 17, y: 1, width: 4, height: 4)).fill()
+            }
         }
         return true
     }
@@ -39,13 +66,11 @@ func statusImage(percent: Double?, stale: Bool) -> NSImage {
 
 @MainActor
 final class HeaderView: NSView {
-    init(title: String, width: CGFloat) {
+    init(title: String, provider: Provider, width: CGFloat) {
         super.init(frame: NSRect(x: 0, y: 0, width: width, height: 28))
         let icon = NSImageView()
-        if let url = Bundle.main.url(forResource: "CodexMark", withExtension: "png") {
-            icon.image = NSImage(contentsOf: url)
-            icon.image?.isTemplate = true
-        }
+        icon.image = provider.markImage
+        icon.image?.isTemplate = true
         icon.contentTintColor = .labelColor
         let label = NSTextField(labelWithString: title)
         label.font = .systemFont(ofSize: 13, weight: .medium)
@@ -71,9 +96,11 @@ final class HeaderView: NSView {
 @MainActor
 final class LimitView: NSView {
     private let usage: UsageWindow
+    private let color: NSColor
     private let heading = NSTextField(labelWithString: "")
-    init(window: UsageWindow, width: CGFloat) {
+    init(window: UsageWindow, color: NSColor, width: CGFloat) {
         self.usage = window
+        self.color = color
         super.init(frame: NSRect(x: 0, y: 0, width: width, height: 50))
         heading.maximumNumberOfLines = 1
         heading.lineBreakMode = .byTruncatingTail
@@ -113,10 +140,10 @@ final class LimitView: NSView {
     }
     override func draw(_ dirtyRect: NSRect) {
         let bar = NSRect(x: 16, y: 10, width: bounds.width - 32, height: 4)
-        NSColor.systemBlue.withAlphaComponent(0.20).setFill()
+        color.withAlphaComponent(0.20).setFill()
         NSBezierPath(roundedRect: bar, xRadius: 2, yRadius: 2).fill()
         if usage.percent > 0 {
-            NSColor.systemBlue.setFill()
+            color.setFill()
             NSBezierPath(
                 roundedRect: NSRect(
                     x: bar.minX, y: bar.minY,
@@ -129,15 +156,17 @@ final class LimitView: NSView {
 
 @MainActor
 final class EstimateView: NSView {
-    private let values: [Double]
-    init(estimate: Estimate, width: CGFloat) {
-        values = estimate.dailyCosts
+    private let series: [(values: [Double], color: NSColor)]
+    init(estimate: Estimate, providers: [Provider], width: CGFloat) {
+        series = providers.compactMap { provider in
+            estimate.dailyCosts[provider.rawValue].map { ($0, provider.color) }
+        }
         super.init(frame: NSRect(x: 0, y: 0, width: width, height: 142))
         let title = NSTextField(labelWithString: "Estimated API cost")
         title.font = .systemFont(ofSize: 13, weight: .medium)
         title.frame = NSRect(x: 14, y: 118, width: width - 28, height: 20)
         title.toolTip =
-            "Estimated API equivalent of local Codex sessions, not your subscription bill."
+            "Estimated API equivalent of local sessions, not your subscription bill."
         addSubview(title)
         for (index, row) in [
             ("Today", estimate.today), ("7 days", estimate.week), ("30 days", estimate.month),
@@ -166,20 +195,23 @@ final class EstimateView: NSView {
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
     override func draw(_ dirtyRect: NSRect) {
-        guard let maxValue = values.max(), values.count > 1 else { return }
+        // One shared scale keeps the providers' lines comparable.
+        guard let maxValue = series.flatMap(\.values).max() else { return }
         // Include the 0.75 pt half-stroke in the shared 16 pt inset.
         let area = NSRect(x: 16.75, y: 84, width: bounds.width - 33.5, height: 22)
-        let path = NSBezierPath()
-        path.lineWidth = 1.5
-        path.lineCapStyle = .round
-        path.lineJoinStyle = .round
-        for (index, value) in values.enumerated() {
-            let point = NSPoint(
-                x: area.minX + area.width * CGFloat(index) / CGFloat(values.count - 1),
-                y: area.minY + (maxValue > 0 ? area.height * value / maxValue : 0))
-            if index == 0 { path.move(to: point) } else { path.line(to: point) }
+        for (values, color) in series where values.count > 1 {
+            let path = NSBezierPath()
+            path.lineWidth = 1.5
+            path.lineCapStyle = .round
+            path.lineJoinStyle = .round
+            for (index, value) in values.enumerated() {
+                let point = NSPoint(
+                    x: area.minX + area.width * CGFloat(index) / CGFloat(values.count - 1),
+                    y: area.minY + (maxValue > 0 ? area.height * value / maxValue : 0))
+                if index == 0 { path.move(to: point) } else { path.line(to: point) }
+            }
+            color.setStroke()
+            path.stroke()
         }
-        NSColor.systemBlue.setStroke()
-        path.stroke()
     }
 }

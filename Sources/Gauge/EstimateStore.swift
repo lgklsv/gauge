@@ -5,6 +5,7 @@ private struct Rate: Codable {
     var output: Double
     var cached: Double
     var cacheWrite: Double
+    var cacheWrite1h: Double?
 }
 private struct RateCache: Codable {
     var fetchedAt: Date
@@ -56,6 +57,10 @@ private struct TokenEvent: Codable {
     var cached: Double
     var cacheWrite: Double
     var output: Double
+    // Claude only: the share of cacheWrite billed at the 1-hour cache price, and the
+    // message id used to drop the repeated records Claude Code writes per response.
+    var cacheWrite1h: Double?
+    var id: String?
     var tokens: Double { input + cached + cacheWrite + output }
 }
 private struct Cursor: Codable {
@@ -68,6 +73,13 @@ private struct Cursor: Codable {
     var sawMeta = false
     var forkAnchor: Date?
     var events: [TokenEvent] = []
+    var provider: Provider? // nil for cursors saved before Claude support: Codex
+}
+
+private func count(_ object: [String: Any]?, _ key: String) -> Double {
+    guard let value = object?[key] as? NSNumber, CFGetTypeID(value) != CFBooleanGetTypeID(),
+          value.doubleValue.isFinite else { return 0 }
+    return max(0, value.doubleValue.rounded(.down))
 }
 
 actor EstimateStore {
@@ -80,15 +92,15 @@ actor EstimateStore {
     private var importedSwiftBar = loadJSON("swiftbar-imported.json", as: Bool.self) ?? false
     private var retryRatesAt = Date.distantPast
 
-    func refresh() async -> Estimate {
-        let unreadable = scanSessions()
+    func refresh(providers: [Provider]) async -> Estimate {
+        let unreadable = scanSessions(providers: providers)
         var models = Set<String>()
-        for cursor in files.values {
+        for cursor in files.values where providers.contains(cursor.provider ?? .codex) {
             models.formUnion(cursor.events.lazy.map(\.model))
         }
         await refreshRates(for: models)
-        var result = summarize(now: Date())
-        if unreadable { result.warning = "Some Codex session logs could not be read. Saved statistics are retained." }
+        var result = summarize(now: Date(), providers: providers)
+        if unreadable { result.warning = "Some session logs could not be read. Saved statistics are retained." }
         if !models.isEmpty && ratesFetchedAt == nil {
             result.warning = "Pricing unavailable. Token totals are shown; costs are incomplete."
         } else if let fetchedAt = ratesFetchedAt, Date().timeIntervalSince(fetchedAt) > 2 * 86400 {
@@ -97,16 +109,21 @@ actor EstimateStore {
         return result
     }
 
-    private func scanSessions() -> Bool {
+    private func scanSessions(providers: [Provider]) -> Bool {
         let now = Date()
         let cutoff = now.addingTimeInterval(-32 * 86400)
         let fm = FileManager.default
-        let directory = codexHome.appendingPathComponent("sessions")
         var unreadable = false
         let needsImport = !importedSwiftBar
         var changed = autoreleasepool { importSwiftBarHistory(cutoff: cutoff) }
-        if let enumerator = fm.enumerator(at: directory, includingPropertiesForKeys: nil,
-                                           options: [.skipsHiddenFiles]) {
+        for provider in providers {
+            let directory = provider == .codex
+                ? codexHome.appendingPathComponent("sessions") : claudeHome.appendingPathComponent("projects")
+            guard let enumerator = fm.enumerator(at: directory, includingPropertiesForKeys: nil,
+                                                 options: [.skipsHiddenFiles]) else {
+                unreadable = true
+                continue
+            }
             for case let url as URL in enumerator where url.pathExtension == "jsonl" {
                 do {
                     let attributes = try fm.attributesOfItem(atPath: url.path)
@@ -120,6 +137,7 @@ actor EstimateStore {
                     if cursor.inode != inode || size < cursor.size || (size == cursor.size && modified != cursor.modified) {
                         cursor = Cursor()
                     }
+                    if provider != .codex { cursor.provider = provider }
                     let handle = try FileHandle(forReadingFrom: url)
                     defer { try? handle.close() }
                     try handle.seek(toOffset: cursor.offset)
@@ -133,7 +151,10 @@ actor EstimateStore {
                                 let line = Data(pending[..<newline])
                                 cursor.offset += UInt64(pending.distance(from: pending.startIndex, to: end))
                                 pending.removeSubrange(..<end)
-                                autoreleasepool { parse(line, cursor: &cursor, cutoff: cutoff) }
+                                autoreleasepool {
+                                    if provider == .codex { parse(line, cursor: &cursor, cutoff: cutoff) }
+                                    else { parseClaude(line, cursor: &cursor, cutoff: cutoff) }
+                                }
                             }
                             return true
                         }
@@ -147,7 +168,7 @@ actor EstimateStore {
                     changed = true
                 } catch { unreadable = true }
             }
-        } else { unreadable = true }
+        }
         for path in Array(files.keys) {
             let count = files[path]!.events.count
             files[path]!.events.removeAll { $0.time < cutoff }
@@ -228,16 +249,32 @@ actor EstimateStore {
             cursor.forkAnchor = nil
         }
         guard date >= cutoff else { return }
-        func number(_ key: String) -> Double {
-            guard let value = last[key] as? NSNumber, CFGetTypeID(value) != CFBooleanGetTypeID(),
-                  value.doubleValue.isFinite else { return 0 }
-            return max(0, value.doubleValue.rounded(.down))
-        }
-        let cached = number("cached_input_tokens")
-        let write = number("cache_write_input_tokens")
+        let cached = count(last, "cached_input_tokens")
+        let write = count(last, "cache_write_input_tokens")
         let event = TokenEvent(time: date, model: cursor.model,
-                               input: max(0, number("input_tokens") - cached - write),
-                               cached: cached, cacheWrite: write, output: number("output_tokens"))
+                               input: max(0, count(last, "input_tokens") - cached - write),
+                               cached: cached, cacheWrite: write, output: count(last, "output_tokens"))
+        if event.tokens > 0 { cursor.events.append(event) }
+    }
+
+    private func parseClaude(_ line: Data, cursor: inout Cursor, cutoff: Date) {
+        guard line.range(of: Data("\"assistant\"".utf8)) != nil,
+              line.range(of: Data("\"usage\"".utf8)) != nil,
+              let record = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
+              record["type"] as? String == "assistant",
+              let message = record["message"] as? [String: Any],
+              let usage = message["usage"] as? [String: Any],
+              let model = message["model"] as? String, model != "<synthetic>",
+              let date = parseDate(record["timestamp"]), date >= cutoff else { return }
+        // Claude Code repeats a response's usage on each of its content block records.
+        let id = (message["id"] as? String).map { "\($0):\(record["requestId"] as? String ?? "")" }
+        if let id, cursor.events.suffix(16).contains(where: { $0.id == id }) { return }
+        let write = count(usage, "cache_creation_input_tokens")
+        let write1h = min(write, count(usage["cache_creation"] as? [String: Any], "ephemeral_1h_input_tokens"))
+        let event = TokenEvent(time: date, model: model, input: count(usage, "input_tokens"),
+                               cached: count(usage, "cache_read_input_tokens"), cacheWrite: write,
+                               output: count(usage, "output_tokens"),
+                               cacheWrite1h: write1h > 0 ? write1h : nil, id: id)
         if event.tokens > 0 { cursor.events.append(event) }
     }
 
@@ -250,7 +287,7 @@ actor EstimateStore {
         if ratesFetchedAt == nil || models != pricedModels {
             // Decode and filter inside the pool; do not retain the full table.
             let cached: RateCache? = autoreleasepool {
-                guard let data = try? Data(contentsOf: supportDirectory.appendingPathComponent("rates-v1.json")) else { return nil }
+                guard let data = try? Data(contentsOf: supportDirectory.appendingPathComponent("rates-v2.json")) else { return nil }
                 let decoder = JSONDecoder()
                 decoder.userInfo[neededModelsKey] = models
                 return try? decoder.decode(RateCache.self, from: data)
@@ -281,12 +318,14 @@ actor EstimateStore {
                           input.isFinite, output.isFinite, input >= 0, output >= 0 else { continue }
                     let cached = entry["cache_read_input_token_cost"] as? Double ?? input
                     let write = entry["cache_creation_input_token_cost"] as? Double ?? input
+                    let write1h = entry["cache_creation_input_token_cost_above_1hr"] as? Double
                     guard cached.isFinite, write.isFinite, cached >= 0, write >= 0 else { continue }
-                    table[name.lowercased()] = Rate(input: input, output: output, cached: cached, cacheWrite: write)
+                    table[name.lowercased()] = Rate(input: input, output: output, cached: cached, cacheWrite: write,
+                                                    cacheWrite1h: write1h.flatMap { $0.isFinite && $0 >= 0 ? $0 : nil })
                 }
                 guard !table.isEmpty else { return nil }
                 let full = RateCache(fetchedAt: Date(), table: table)
-                saveJSON(full, name: "rates-v1.json")
+                saveJSON(full, name: "rates-v2.json")
                 return RateCache(fetchedAt: full.fetchedAt, table: prices(for: models, in: table))
             }
             if let filtered {
@@ -304,8 +343,10 @@ actor EstimateStore {
         return selected
     }
 
-    private func summarize(now: Date) -> Estimate {
+    private func summarize(now: Date, providers: [Provider]) -> Estimate {
         var result = Estimate()
+        for provider in providers { result.dailyCosts[provider.rawValue] = Array(repeating: 0, count: 7) }
+        var seen = Set<String>()
         let calendar = Calendar.current
         let today = calendar.startOfDay(for: now)
         let week = now.addingTimeInterval(-7 * 86400)
@@ -316,18 +357,23 @@ actor EstimateStore {
             if unpriced { bucket.unpriced += event.tokens }
         }
         for cursor in files.values {
+            let provider = (cursor.provider ?? .codex).rawValue
+            guard result.dailyCosts[provider] != nil else { continue }
             for event in cursor.events where event.time <= now {
+                // A resumed Claude session may copy earlier responses into a new log.
+                if let id = event.id, !seen.insert(id).inserted { continue }
                 let rate = rates[event.model]
                 var cost = 0.0
                 if let rate {
-                    cost = event.input * rate.input + event.cached * rate.cached
-                    cost += event.cacheWrite * rate.cacheWrite + event.output * rate.output
+                    let write1h = event.cacheWrite1h ?? 0
+                    cost = event.input * rate.input + event.cached * rate.cached + event.output * rate.output
+                    cost += (event.cacheWrite - write1h) * rate.cacheWrite + write1h * (rate.cacheWrite1h ?? rate.cacheWrite)
                 }
                 if event.time >= today { add(event, cost, rate == nil, to: &result.today) }
                 if event.time >= week { add(event, cost, rate == nil, to: &result.week) }
                 if event.time >= month { add(event, cost, rate == nil, to: &result.month) }
                 let days = calendar.dateComponents([.day], from: calendar.startOfDay(for: event.time), to: today).day ?? 99
-                if (0..<7).contains(days) { result.dailyCosts[6 - days] += cost }
+                if (0..<7).contains(days) { result.dailyCosts[provider]![6 - days] += cost }
             }
         }
         return result

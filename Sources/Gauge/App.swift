@@ -1,20 +1,26 @@
 import AppKit
 import ServiceManagement
 
+private struct Feed {
+    var snapshot: UsageSnapshot?
+    var errorMessage: String?
+    var retryAt = Date.distantPast
+    var failures = 0
+}
+
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var status: NSStatusItem!
     private let menu = NSMenu()
     private let client = UsageClient()
     private let estimates = EstimateStore()
-    private var snapshot = loadJSON("usage-v1.json", as: UsageSnapshot.self)
-    private var estimate = loadJSON("estimate-v1.json", as: Estimate.self)
+    private var feeds = Dictionary(uniqueKeysWithValues: Provider.allCases.map {
+        ($0, Feed(snapshot: loadJSON($0.cacheName, as: UsageSnapshot.self)))
+    })
+    private var estimate = loadJSON("estimate-v2.json", as: Estimate.self)
     private var estimateRefreshedAt = Date.distantPast
-    private var errorMessage: String?
     private var loginError: String?
     private var refreshing = false
-    private var retryAt = Date.distantPast
-    private var failures = 0
     private var timer: Timer?
     private var countdownTimer: Timer?
     private var sleeping = false
@@ -22,10 +28,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var limitViews: [LimitView] = []
     private let width: CGFloat = 292
     private var iconKey = ""
+    private lazy var settings = SettingsController(
+        onProvidersChanged: { [weak self] in self?.providersChanged() },
+        setLaunchAtLogin: { [weak self] in self?.setLaunchAtLogin($0) })
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
-        status = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        status = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         status.menu = menu
         menu.delegate = self
         menu.autoenablesItems = false
@@ -71,6 +80,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    private func setLaunchAtLogin(_ enabled: Bool) {
+        let service = SMAppService.mainApp
+        do {
+            if enabled { try service.register() } else { try service.unregister() }
+            loginError = service.status == .requiresApproval
+                ? "Approve Gauge in System Settings → General → Login Items." : nil
+        } catch {
+            loginError = "Could not change Launch at Login: \(error.localizedDescription)"
+        }
+        // Remember this location so configureLogin respects the choice on next launch.
+        UserDefaults.standard.set(Bundle.main.bundleURL.standardizedFileURL.path, forKey: "loginRegistrationPath")
+    }
+
+    private func providersChanged() {
+        estimateRefreshedAt = .distantPast
+        updateIcon()
+        if menuOpen { rebuildMenu() }
+        refresh()
+    }
+
     func menuWillOpen(_ menu: NSMenu) {
         menuOpen = true
         rebuildMenu()
@@ -90,57 +119,73 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func willSleep() { sleeping = true }
     @objc private func didWake() { sleeping = false; refresh() }
     @objc private func manualRefresh() { refresh(force: true) }
-    @objc private func openUsage() {
-        NSWorkspace.shared.open(URL(string: "https://chatgpt.com/codex/settings/usage")!)
-    }
+    @objc private func openSettings() { settings.show() }
     @objc private func quit() { NSApp.terminate(nil) }
 
     private func refresh(force: Bool = false) {
         guard !refreshing, !sleeping else { return }
-        let usageIsStale = snapshot.map { Date().timeIntervalSince($0.fetchedAt) >= 55 } ?? true
-        let fetchUsage = Date() >= retryAt && (force || errorMessage != nil || usageIsStale)
-        let refreshEstimate = force || Date().timeIntervalSince(estimateRefreshedAt) >= 55
-        guard fetchUsage || refreshEstimate else { return }
+        let now = Date()
+        let providers = Provider.enabled
+        let due = providers.filter { provider in
+            let feed = feeds[provider]!
+            let isStale = feed.snapshot.map { now.timeIntervalSince($0.fetchedAt) >= provider.refreshInterval - 5 } ?? true
+            return now >= feed.retryAt && (force || feed.errorMessage != nil || isStale)
+        }
+        let refreshEstimate = force || now.timeIntervalSince(estimateRefreshedAt) >= 55
+        guard !due.isEmpty || refreshEstimate else { return }
         refreshing = true
         if menuOpen { rebuildMenu() }
+        let client = client
         Task {
-            async let newEstimate = estimates.refresh()
-            if fetchUsage {
-                do {
-                    let next = try await client.fetch()
-                    snapshot = next
-                    saveJSON(next, name: "usage-v1.json")
-                    errorMessage = nil
-                    failures = 0
-                    retryAt = .distantPast
-                } catch {
-                    failures = min(failures + 1, 6)
-                    let delay = max((error as? GaugeError)?.retryAfter ?? 60, min(1800, 30 * pow(2, Double(failures))))
-                    retryAt = Date().addingTimeInterval(delay)
-                    errorMessage = (error as? GaugeError)?.message ?? "Could not refresh usage. Check your connection."
+            async let newEstimate = estimates.refresh(providers: providers)
+            await withTaskGroup(of: (Provider, Result<UsageSnapshot, Error>).self) { group in
+                for provider in due {
+                    group.addTask {
+                        do { return (provider, .success(try await client.fetch(provider))) }
+                        catch { return (provider, .failure(error)) }
+                    }
                 }
+                for await (provider, result) in group { apply(result, to: provider) }
             }
             let result = await newEstimate
             estimate = result
             estimateRefreshedAt = Date()
-            saveJSON(result, name: "estimate-v1.json")
+            saveJSON(result, name: "estimate-v2.json")
             refreshing = false
             updateIcon()
             if menuOpen { rebuildMenu() }
         }
     }
 
+    private func apply(_ result: Result<UsageSnapshot, Error>, to provider: Provider) {
+        var feed = feeds[provider]!
+        switch result {
+        case .success(let next):
+            feed.snapshot = next
+            saveJSON(next, name: provider.cacheName)
+            feed.errorMessage = nil
+            feed.failures = 0
+            feed.retryAt = .distantPast
+        case .failure(let error):
+            feed.failures = min(feed.failures + 1, 6)
+            let delay = max((error as? GaugeError)?.retryAfter ?? 60, min(1800, 30 * pow(2, Double(feed.failures))))
+            feed.retryAt = Date().addingTimeInterval(delay)
+            feed.errorMessage = (error as? GaugeError)?.message ?? "Could not refresh usage. Check your connection."
+        }
+        feeds[provider] = feed
+    }
+
     private func updateIcon() {
-        let percent = snapshot?.windows.first?.percent
-        let stale = errorMessage != nil || snapshot == nil
-        let key = "\(percent ?? -1)-\(stale)"
+        let rings = Provider.enabled.map { provider in
+            let feed = feeds[provider]!
+            return StatusRing(provider: provider, percent: feed.snapshot?.windows.first?.percent,
+                              stale: feed.errorMessage != nil || feed.snapshot == nil)
+        }
+        let key = rings.map { "\($0.provider)-\($0.percent ?? -1)-\($0.stale)" }.joined(separator: ",")
         if key != iconKey {
-            status.button?.image = statusImage(percent: percent, stale: stale)
+            status.button?.image = statusImage(rings: rings)
             iconKey = key
         }
-        status.button?.toolTip = snapshot.map { data in
-            "Codex · " + data.windows.map { "\($0.label): \(Int($0.percent))%" }.joined(separator: " · ")
-        } ?? "Codex usage unavailable"
     }
 
     @discardableResult
@@ -153,42 +198,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func rebuildMenu() {
         menu.removeAllItems()
         limitViews = []
-        let plan = snapshot?.plan.map { " · \($0.capitalized)" } ?? ""
-        let header = NSMenuItem()
-        header.view = HeaderView(title: "Codex\(plan)", width: width)
-        menu.addItem(header)
-        menu.addItem(.separator())
-        if let snapshot {
-            for window in snapshot.windows {
-                let view = LimitView(window: window, width: width)
-                limitViews.append(view)
-                let row = NSMenuItem()
-                row.view = view
-                menu.addItem(row)
+        let providers = Provider.enabled
+        for provider in providers {
+            let feed = feeds[provider]!
+            let plan = feed.snapshot?.plan.map { " · \($0.capitalized)" } ?? ""
+            let header = NSMenuItem()
+            header.view = HeaderView(title: "\(provider.name)\(plan)", provider: provider, width: width)
+            menu.addItem(header)
+            if let snapshot = feed.snapshot {
+                for window in snapshot.windows {
+                    let view = LimitView(window: window, color: provider.color, width: width)
+                    limitViews.append(view)
+                    let row = NSMenuItem()
+                    row.view = view
+                    menu.addItem(row)
+                }
+                if let credits = snapshot.credits { item(credits).isEnabled = false }
+            } else { item(refreshing ? "Loading usage…" : "Usage unavailable").isEnabled = false }
+            if let errorMessage = feed.errorMessage {
+                let warning = item(feed.snapshot == nil ? "Usage update failed" : "Using saved usage · Update failed")
+                warning.isEnabled = false
+                warning.toolTip = errorMessage
+                if let snapshot = feed.snapshot {
+                    let updated = item("Updated \(snapshot.fetchedAt.formatted(date: .omitted, time: .shortened))")
+                    updated.isEnabled = false
+                }
             }
-            if let credits = snapshot.credits { item(credits).isEnabled = false }
-        } else { item(refreshing ? "Loading usage…" : "Usage unavailable").isEnabled = false }
-        menu.addItem(.separator())
+            menu.addItem(.separator())
+        }
         if let estimate {
             let statistics = NSMenuItem()
-            statistics.view = EstimateView(estimate: estimate, width: width)
+            statistics.view = EstimateView(estimate: estimate, providers: providers, width: width)
             menu.addItem(statistics)
         } else {
             item("Loading local statistics…").isEnabled = false
         }
         menu.addItem(.separator())
-        item("Open Codex Usage…", action: #selector(openUsage))
         let refreshItem = item(refreshing ? "Refreshing…" : "Refresh", action: #selector(manualRefresh))
         refreshItem.isEnabled = !refreshing
-        if let errorMessage {
-            let warning = item(snapshot == nil ? "Usage update failed" : "Using saved usage · Update failed")
-            warning.isEnabled = false
-            warning.toolTip = errorMessage
-            if let snapshot {
-                let updated = item("Updated \(snapshot.fetchedAt.formatted(date: .omitted, time: .shortened))")
-                updated.isEnabled = false
-            }
-        }
+        item("Settings…", action: #selector(openSettings)).keyEquivalent = ","
         if let warning = estimate?.warning {
             let warningItem = item("Statistics may be incomplete")
             warningItem.isEnabled = false
@@ -222,12 +270,17 @@ struct Gauge {
         }
         if CommandLine.arguments.contains("--diagnose") {
             // Read-only integration check. Never print credentials or session contents.
-            do {
-                let snapshot = try await UsageClient().fetch()
-                print("Usage: \(snapshot.windows.map { "\($0.label)=\(Int($0.percent))%" }.joined(separator: ", "))")
-            } catch { print("Usage: \(error.localizedDescription)") }
-            let result = await EstimateStore().refresh()
-            saveJSON(result, name: "estimate-v1.json")
+            for provider in Provider.allCases {
+                do {
+                    let snapshot = try await UsageClient().fetch(provider)
+                    print("\(provider.name): \(snapshot.windows.map { "\($0.label)=\(Int($0.percent))%" }.joined(separator: ", "))")
+                } catch { print("\(provider.name): \(error.localizedDescription)") }
+            }
+            let result = await EstimateStore().refresh(providers: Provider.allCases)
+            saveJSON(result, name: "estimate-v2.json")
+            for (provider, days) in result.dailyCosts.sorted(by: { $0.key < $1.key }) {
+                print("Daily \(provider): \(days.map { String(format: "%.2f", $0) }.joined(separator: " "))")
+            }
             print("Estimates: today=\(result.today.costText)/\(result.today.tokenText), 7d=\(result.week.costText)/\(result.week.tokenText), 30d=\(result.month.costText)/\(result.month.tokenText)")
             if let warning = result.warning { print(warning) }
             return
