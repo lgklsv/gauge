@@ -168,7 +168,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             feed.retryAt = .distantPast
         case .failure(let error):
             feed.failures = min(feed.failures + 1, 6)
-            let delay = max((error as? GaugeError)?.retryAfter ?? 60, min(1800, 30 * pow(2, Double(feed.failures))))
+            // Never retry sooner than the provider's normal schedule.
+            let delay = max(provider.refreshInterval, (error as? GaugeError)?.retryAfter ?? 60,
+                            min(1800, 30 * pow(2, Double(feed.failures))))
             feed.retryAt = Date().addingTimeInterval(delay)
             feed.errorMessage = (error as? GaugeError)?.message ?? "Could not refresh usage. Check your connection."
         }
